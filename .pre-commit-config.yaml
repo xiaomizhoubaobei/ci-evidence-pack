@@ -24,7 +24,7 @@ repos:
     args: ['--fix=lf']
 
 - repo: https://github.com/psf/black-pre-commit-mirror
-  rev: 26.3.0
+  rev: 26.10.1
   hooks:
   - id: black
     # 不绑 language_version：任一本机 Python 3.10+ 均可跑通。
@@ -40,7 +40,7 @@ repos:
     # 避免「配置文件里改了、这里没改」两边打架。
 
 - repo: https://github.com/pycqa/isort
-  rev: 9.0.2
+  rev: 10.0.0b1
   hooks:
   - id: isort
     # 9.0.2 是 isort 首个 requires-python>=3.10 的稳定版，与本项目最低版本对齐；
