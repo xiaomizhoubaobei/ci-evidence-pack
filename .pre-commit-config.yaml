@@ -24,7 +24,7 @@ repos:
     args: ['--fix=lf']
 
 - repo: https://github.com/psf/black-pre-commit-mirror
-  rev: 26.3.0
+  rev: 26.10.1
   hooks:
   - id: black
     # 不绑 language_version：任一本机 Python 3.10+ 均可跑通。
@@ -33,21 +33,21 @@ repos:
     args: ['--target-version', 'py313']
 
 - repo: https://github.com/pycqa/flake8
-  rev: 7.4.1
+  rev: 7.5.0
   hooks:
   - id: flake8
     # 行长/ignore 与 per-file-ignores 一并写在 .flake8，命令行长参数只留指向它的引用，
     # 避免「配置文件里改了、这里没改」两边打架。
 
 - repo: https://github.com/pycqa/isort
-  rev: 9.0.2
+  rev: 10.0.0b2
   hooks:
   - id: isort
     # 9.0.2 是当前稳定版，在 3.13 环境下可正常安装运行。
     args: ['--profile', 'black']
 
 - repo: https://github.com/pre-commit/mirrors-mypy
-  rev: v2.4.0
+  rev: v2.4.1
   hooks:
   - id: mypy
     # 内核纯标准库（外部命令走 subprocess），第三方依赖只在测试里出现；
