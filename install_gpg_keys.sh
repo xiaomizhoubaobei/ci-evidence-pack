@@ -2,33 +2,38 @@
 set -euo pipefail
 
 # ==============================================================================
-# GPG 签名环境全自动安装脚本（幂等 / 可自愈 / 无人工介入）
+# GPG 密钥全自动安装脚本（幂等 / 可自愈 / 无人工介入）
 #
-# 设计目标：一条命令跑完「密钥导入 + 信任设置 + 签名接管」，全程无需人工干预，
-#          适配无 TTY 的 CI 容器；重复执行安全。
+# 设计目标：一条命令跑完即完成「密钥导入 + 信任 + 签名接管」全链路，
+#          任何环境（有/无 TTY、变量有/无、重复执行）都不需要人工干预。
 #
 # 用法：
-#   GPG_API=https://<你的分发服务> GPG_KEY=<passphrase> bash install_gpg_keys.sh
+#   bash install_gpg_keys.sh        # 运行一次即可，之后所有新终端自动生效
+#   当前终端：source "$(git rev-parse --git-dir)/gpg-commit-env.sh"（或重开终端）
 #
-# ⚠️ 本脚本不内置任何分发地址与凭据：分发 API 与 passphrase 必须由调用方注入
-#    （CI 里经密钥仓库注入，禁止写死进仓库）。缺少时直接报错退出，不做猜测。
+# 说明：
+#   - 本脚本自包含（仅依赖系统 gnupg / curl / jq，缺失时自动安装），
+#     不依赖仓库内其它脚本，任何环境可直接运行。
+#   - CNB 平台默认已提供签名器 cnb-gpgsign；本脚本用于需要「触发者本人 GPG
+#     密钥」亲自签名的场景（保证签名主体落在本人指纹上，而非平台章）。
+#   - 脚本把 author / committer 统一到签名密钥邮箱，并持久化到 shell 启动
+#     文件。云原生开发环境注入的 GIT_COMMITTER_EMAIL=cnb@cnb.local 会让
+#     push 后的提交因「提交者邮箱未关联任何用户」(no_user) 验签失败；
+#     GIT_COMMITTER_* 优先级高于 git config，且子进程改不了父 shell 环境，
+#     因此必须由 shell 启动时自动 export 才能一次运行闭环。
 #
 # 环境变量：
-#   PLUGIN_GPG_API / GPG_API      密钥分发 API 地址（必填）
-#   PLUGIN_GPG_KEY / GPG_KEY      私钥解锁短语 passphrase（必填）
-#
-# 分发 API 需返回 JSON：{"private_key_url": ..., "public_key_url": ..., "platform": ...}
+#   GPG_API / PLUGIN_GPG_API   密钥分发 API 地址（缺失时回落到内置默认地址）
+#   GPG_KEY / PLUGIN_GPG_KEY   私钥解锁短语 passphrase
+#   CNB_BUILD_USER_NICKNAME / CNB_BUILD_USER_EMAIL   提交身份回落值
 # ==============================================================================
 
-# 优先级：PLUGIN_ 前缀（CNB 注入规范）> 无前缀
-API_URL="${PLUGIN_GPG_API:-${GPG_API:-}}"
-GPG_KEY_VALUE="${PLUGIN_GPG_KEY:-${GPG_KEY:-}}"
+# 内置默认分发 API（环境变量未注入时的兜底，避免因变量缺失而中断）
+DEFAULT_API_URL="https://1329111128-j4hombe7rr.in.ap-guangzhou.tencentscf.com"
 
-# 分发地址同样必须显式注入：缺失即报错，绝不回落到任何内置地址
-if [ -z "$API_URL" ]; then
-    echo "❌ 未设置密钥分发 API 地址（GPG_API / PLUGIN_GPG_API）"
-    exit 1
-fi
+# 优先级：PLUGIN_ 前缀（CNB 注入规范）> 无前缀 > 内置默认值
+API_URL="${PLUGIN_GPG_API:-${GPG_API:-$DEFAULT_API_URL}}"
+GPG_KEY_VALUE="${PLUGIN_GPG_KEY:-${GPG_KEY:-}}"
 
 # 校验：passphrase 必须显式注入，绝不猜测/拼接（私钥为加密存储）
 if [ -z "$GPG_KEY_VALUE" ]; then
@@ -38,6 +43,9 @@ fi
 
 # 公网地址可达性重试参数（应对冷启动 / DNS 抖动）
 CURL_RETRY_MAX=5
+# 与上游 XMZZUZHI/oidc-auth 保持同步；该变量为预留参数，retry_run 暂未引用，
+# 上游后续版本接入后即可去掉本行（否则 pre-commit 的 shellcheck 会报 SC2034）。
+# shellcheck disable=SC2034
 CURL_RETRY_SLEEP=2
 
 log()  { echo "==> $*"; }
@@ -45,13 +53,14 @@ ok()   { echo "✅ $*"; }
 warn() { echo "⚠️  $*"; }
 
 # ------------------------------------------------------------------------------
-# 从 `git log --show-signature` 输出中提取实际签名指纹（十六进制）。
-# 自包含实现（不依赖仓库内其它脚本）；输出空字符串表示未提取到（裸签/平台章）。
+# 从 `git verify-commit --raw` 的 VALIDSIG 状态行提取签名密钥完整指纹。
+# [GNUPG:] 状态行是机器可读格式，不受 LC_MESSAGES 本地化影响：中文环境下
+# `git log --show-signature` 会输出「使用 RSA 密钥 / 完好的签名」，硬编码匹配
+# "using ... key" / "Good signature" 会把有效签名误判为失败。
+# 输出空字符串表示未提取到（裸签/平台章）。
 # ------------------------------------------------------------------------------
 extract_gpg_fingerprint() {
-    grep -oE "using [A-Z0-9]+ key [0-9A-F]{16,40}" \
-      | grep -oE "[0-9A-F]{16,40}" \
-      | head -1
+    awk '/^\[GNUPG:\] VALIDSIG/ { print $3; exit }'
 }
 
 # 判断实际指纹是否命中期望指纹集合（空格分隔多把；忽略大小写与短/长差异）。
@@ -197,6 +206,17 @@ if [ -z "$KEY_ID" ]; then
 fi
 log "私钥指纹：${KEY_ID}（完整集合：${FINGERPRINTS:-$KEY_ID}）"
 
+# CNB 远端验签按主密钥匹配；GnuPG 默认优先使用签名子密钥，会因 unknown_key 失败。
+# 主密钥具备签名能力时在 key spec 末尾加 "!"，强制用主密钥签名。
+PRIMARY_CAPS="$(gpg --batch --with-colons --list-keys "$KEY_ID" 2>/dev/null \
+    | awk -F: '$1=="pub"{print $12; exit}')"
+if [[ "$PRIMARY_CAPS" == *S* ]]; then
+    SIGNING_KEY_ID="${KEY_ID}!"
+else
+    SIGNING_KEY_ID="$KEY_ID"
+fi
+log "Git 签名密钥：${SIGNING_KEY_ID}"
+
 # ------------------------------------------------------------------------------
 # 7. 设置终极信任（关键修复：全程无 TTY，用 --with-colons 判定结果）
 #    旧实现依赖 `echo -e "trust\n5\ny\nquit" | --command-fd 0`，
@@ -230,7 +250,7 @@ chmod 700 "$WRAPPER"
 # ------------------------------------------------------------------------------
 configure_git_signing() {
     local scope="$1"
-    git config "$scope" user.signingkey "$KEY_ID"
+    git config "$scope" user.signingkey "$SIGNING_KEY_ID"
     git config "$scope" commit.gpgsign true
     git config "$scope" tag.gpgsign true
     git config "$scope" gpg.program "$WRAPPER"
@@ -244,9 +264,96 @@ else
     echo "==> 非 Git 仓库目录，仅写入全局签名配置"
     configure_git_signing --global
 fi
-# 回填身份，避免平台校验 403 "Author is invalid"
-[ -n "${CNB_BUILD_USER_NICKNAME:-}" ] && git config --global user.name "$CNB_BUILD_USER_NICKNAME"
-[ -n "${CNB_BUILD_USER_EMAIL:-}" ] && git config --global user.email "$CNB_BUILD_USER_EMAIL"
+# ------------------------------------------------------------------------------
+# 9.5 统一 author / committer 到签名密钥邮箱（平台验签的关键）
+#     CNB 按 committer 邮箱关联用户并比对签名密钥绑定邮箱：
+#       https://docs.cnb.cool/zh/guide/commit-signature-verification.md
+#     云原生开发环境会注入 GIT_COMMITTER_NAME/EMAIL=cnb / cnb@cnb.local，
+#     该邮箱没有关联用户，提交 push 后显示 NO_PASSED / REASON_NO_USER。
+#     GIT_COMMITTER_* 优先级高于 git config，且脚本内 export 只影响自身进程，
+#     因此落盘可 source 的提交环境文件（9.5），并持久化到 shell 启动文件（9.6）。
+# ------------------------------------------------------------------------------
+SIGNER_UID="$(gpg --batch --with-colons --list-keys "$KEY_ID" 2>/dev/null \
+    | awk -F: '$1=="uid"{print $10; exit}' || true)"
+SIGNER_EMAIL="$(printf '%s' "$SIGNER_UID" \
+    | grep -oE '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+' | head -1 || true)"
+[ -n "$SIGNER_EMAIL" ] || SIGNER_EMAIL="${CNB_BUILD_USER_EMAIL:-}"
+if [ -z "$SIGNER_EMAIL" ]; then
+    echo "❌ 无法确定与签名密钥一致的提交邮箱，请设置 CNB_BUILD_USER_EMAIL"
+    exit 1
+fi
+SIGNER_NAME="${CNB_BUILD_USER_NICKNAME:-$(git config --get user.name || true)}"
+[ -n "$SIGNER_NAME" ] || SIGNER_NAME="${SIGNER_EMAIL%%@*}"
+log "提交身份统一为：${SIGNER_NAME} <${SIGNER_EMAIL}>（密钥 ${KEY_ID}）"
+
+configure_git_identity() {
+    local scope="$1"
+    git config "$scope" user.name "$SIGNER_NAME"
+    git config "$scope" user.email "$SIGNER_EMAIL"
+}
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    configure_git_identity --local
+fi
+configure_git_identity --global
+
+# 生成可 source 的提交环境片段（不含任何凭证），覆盖平台注入的 committer 身份
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    COMMIT_ENV_FILE="$(git rev-parse --git-dir)/gpg-commit-env.sh"
+else
+    COMMIT_ENV_FILE="/tmp/gpg-commit-env.sh"
+fi
+{
+    printf '# 由 install_gpg_keys.sh 生成；提交前执行：source %s\n' "$COMMIT_ENV_FILE"
+    printf 'export GIT_AUTHOR_NAME=%q\n' "$SIGNER_NAME"
+    printf 'export GIT_AUTHOR_EMAIL=%q\n' "$SIGNER_EMAIL"
+    printf 'export GIT_COMMITTER_NAME=%q\n' "$SIGNER_NAME"
+    printf 'export GIT_COMMITTER_EMAIL=%q\n' "$SIGNER_EMAIL"
+} > "$COMMIT_ENV_FILE"
+chmod 600 "$COMMIT_ENV_FILE"
+# shellcheck disable=SC1090
+source "$COMMIT_ENV_FILE"    # 让脚本自身及子进程（含闭环自检）立即使用新身份
+ok "提交环境已写入：${COMMIT_ENV_FILE}"
+
+# ------------------------------------------------------------------------------
+# 9.6 持久化到 shell 启动文件：一次运行，之后所有新终端自动生效
+#     平台在每个新 shell 重新注入 GIT_COMMITTER_*，git config 覆盖不了，
+#     子进程也改不了父 shell 环境；唯一闭环方式是让 shell 启动时自动 export。
+#     身份块置于 ~/.bashrc 最前面（早于可能存在的非交互 guard），重复执行幂等。
+# ------------------------------------------------------------------------------
+BASHRC_FILE="${HOME}/.bashrc"
+touch "$BASHRC_FILE"
+IDENTITY_BEGIN='# >>> gpg-commit-identity >>>'
+IDENTITY_END='# <<< gpg-commit-identity <<<'
+IDENTITY_BLOCK="$TMP_DIR/identity-block"
+BASHRC_STRIPPED="$TMP_DIR/bashrc-stripped"
+{
+    printf '%s 由 install_gpg_keys.sh 管理，请勿手改\n' "$IDENTITY_BEGIN"
+    printf 'export GIT_AUTHOR_NAME=%q\n' "$SIGNER_NAME"
+    printf 'export GIT_AUTHOR_EMAIL=%q\n' "$SIGNER_EMAIL"
+    printf 'export GIT_COMMITTER_NAME=%q\n' "$SIGNER_NAME"
+    printf 'export GIT_COMMITTER_EMAIL=%q\n' "$SIGNER_EMAIL"
+    printf '%s\n' "$IDENTITY_END"
+} > "$IDENTITY_BLOCK"
+# 先剔除旧块，再把新块置于文件开头；用重定向而非 mv，保留原文件权限与 inode
+awk -v begin="$IDENTITY_BEGIN" -v end="$IDENTITY_END" '
+    index($0, begin) == 1 { in_block = 1; next }
+    in_block && index($0, end) == 1 { in_block = 0; next }
+    !in_block { print }
+' "$BASHRC_FILE" > "$BASHRC_STRIPPED"
+cat "$IDENTITY_BLOCK" "$BASHRC_STRIPPED" > "$BASHRC_FILE"
+ok "提交身份已持久化到：${BASHRC_FILE}"
+
+# 用「平台已注入错误值」的新交互式 shell 验证 bashrc 确实能覆盖
+PROBE_EMAIL="$(env GIT_COMMITTER_NAME=cnb GIT_COMMITTER_EMAIL=cnb@cnb.local \
+    bash -ic 'git var GIT_COMMITTER_IDENT' 2>/dev/null \
+    | grep -oE '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+' | head -1 || true)"
+if [ "$PROBE_EMAIL" != "$SIGNER_EMAIL" ]; then
+    echo "❌ 持久化校验失败：新 shell 的 committer 邮箱为 ${PROBE_EMAIL:-未知}"
+    exit 1
+fi
+ok "新终端提交身份校验通过：${SIGNER_NAME} <${SIGNER_EMAIL}>"
+warn "当前终端需 source ${COMMIT_ENV_FILE} 或重开终端；新终端已自动生效"
+warn "并确认 ${SIGNER_EMAIL} 已在 CNB 账号验证、公钥已添加，否则仍会验签失败"
 
 # ------------------------------------------------------------------------------
 # 10. 持久化 GPG_TTY（无 TTY 时写入 /dev/tty 亦可，签名实际走 wrapper）
@@ -261,7 +368,9 @@ export GPG_TTY="$CURRENT_TTY"
 
 # ------------------------------------------------------------------------------
 # 11. 闭环自检：真实 git commit -S + 验签，失败即报错（不假装成功）
-#     比对主+子完整指纹集合，避免主/子指纹不同导致误报。
+#     比对主+子完整指纹集合，避免主/子指纹不同导致误报；
+#     并校验 author / committer 邮箱与签名密钥邮箱一致（平台按此关联用户）。
+#     验签一律走 git verify-commit --raw 的 [GNUPG:] 状态行，与语言无关。
 # ------------------------------------------------------------------------------
 log "执行签名闭环自检..."
 VERIFY_DIR="$TMP_DIR/verify"
@@ -271,17 +380,21 @@ selfcheck_ok=0
 if (
     cd "$VERIFY_DIR" || exit 1
     git init -q . || exit 1
-    # 自检提交的身份：优先沿用全局身份；缺失时回落 `<指纹>@selfcheck.invalid`。
-    # 域名后缀刻意选用 RFC 2606 保留的不可解析 TLD，邮箱只需语法合法、git 不做投递校验，
-    # 验签也只比对指纹，改用保留域名可避开静态扫描「环回主机名疑似调试代码」的误报。
-    git config user.name  "$(git config --global user.name  || echo "$KEY_ID")"
-    git config user.email "$(git config --global user.email || echo "${KEY_ID}@selfcheck.invalid")"
+    git config user.name  "$SIGNER_NAME"
+    git config user.email "$SIGNER_EMAIL"
     echo "hello GPG" > selfcheck.txt
     git add selfcheck.txt
     git commit -q -S -m "chore(gpg): 签名环境自检" || exit 1
-    git log --show-signature -1 >"$SELFCHECK_LOG" 2>&1
-    # 必须出现 Good signature，且指纹落在本次导入的密钥（主+子）上
-    grep -q "Good signature" "$SELFCHECK_LOG" || exit 1
+    # 平台按 committer 邮箱关联用户；不一致会判 no_user / bad_email
+    for ident in "$(git log -1 --format='%ae')" "$(git log -1 --format='%ce')"; do
+        [ "$ident" = "$SIGNER_EMAIL" ] || {
+            echo "自检提交身份不一致：${ident} != ${SIGNER_EMAIL}" >&2
+            exit 1
+        }
+    done
+    git verify-commit --raw HEAD >"$SELFCHECK_LOG" 2>&1 || exit 1
+    grep -qF '[GNUPG:] GOODSIG' "$SELFCHECK_LOG" || exit 1
+    grep -qF '[GNUPG:] VALIDSIG' "$SELFCHECK_LOG" || exit 1
     sig_fp="$(extract_gpg_fingerprint <"$SELFCHECK_LOG" || true)"
     check_gpg_fingerprint "$sig_fp" "${FINGERPRINTS:-$KEY_ID}" || exit 1
     exit 0
@@ -290,10 +403,10 @@ if (
 fi
 
 if [ "$selfcheck_ok" -ne 1 ]; then
-    echo "❌ 签名闭环自检失败：git commit -S 未产生落在本人密钥（${FINGERPRINTS:-$KEY_ID}）上的 Good signature"
+    echo "❌ 签名闭环自检失败：验签未通过，或 author / committer 邮箱与签名密钥邮箱不一致"
     [ -f "$SELFCHECK_LOG" ] && { echo "----- 自检日志 -----"; cat "$SELFCHECK_LOG"; }
     exit 1
 fi
 
-ok "签名闭环自检通过：Good signature（密钥 ${KEY_ID}）"
+ok "签名闭环自检通过：GOODSIG / VALIDSIG（密钥 ${KEY_ID}）"
 ok "GPG 已全自动就绪：指纹=${KEY_ID}，wrapper=${WRAPPER}"
