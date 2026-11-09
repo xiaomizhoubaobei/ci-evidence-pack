@@ -74,7 +74,7 @@ def test_forged_bundle_with_recomputed_manifest_is_caught_by_anchor(
     work = tmp_path / "forge"
     work.mkdir()
     with tarfile.open(bundle, "r:gz") as tar:
-        tar.extractall(work)
+        tar.extractall(work, filter="data")
     (work / "artifacts" / "src" / "a.txt").write_text("FORGED")
     lines = []
     for p in sorted(work.rglob("*")):

@@ -91,7 +91,9 @@ def safe_extract(bundle_path: Path, dest: Path) -> None:
             total += member.size
             if total > MAX_UNPACKED_BYTES:
                 raise EvidenceInvalid("bundle 解压后体积超限，疑似解压炸弹。")
-            tar.extract(member, path=dest, set_attrs=False)
+            # filter="data"：3.14 起是默认值，这里显式写出来，保证 3.13/3.14
+            # 行为一致，也再多一层防线（上面的检查已拒绝越界路径、链接和特殊文件）。
+            tar.extract(member, path=dest, set_attrs=False, filter="data")
 
 
 def _read_manifest(root: Path) -> dict[str, str]:
