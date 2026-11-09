@@ -1,10 +1,58 @@
-# CNB 侧流水线：只干一件事——把本仓库强制镜像到 GitHub。
+# CNB 侧流水线。两件事：把本仓库强制镜像到 GitHub；给云端 VS Code 预置好开发环境。
 #
 # 单测、打包、Release 都不在这里跑：本仓库的验证入口是 `python -m pytest -q`
 # 与 GitHub Action（action.yml / examples/），CNB 不重复构建一遍。
 #
 # 凭据经密钥仓库注入（见 imports 的 Github.yml）：GIT_USERNAME / GIT_ACCESS_TOKEN
 # / GIT_EMAIL 三个变量由该文件提供，禁止在本文件写死任何 token。
+
+# 云端 VS Code 事件：`$.vscode` 只在「用 VS Code 打开本仓库」时触发，
+# 不参与 push / PR 流程。目的只有一个——把开箱即用的开发环境摆好，
+# 让人打开就能改代码、跑测试、签提交。
+#
+# 刻意保持精瘦：不预装任何 AI CLI，不克隆无关仓库。
+# CLI 是个人口味，装在本机即可；塞进云端镜像只会拖慢每次启动、
+# 还要跟着上游版本号一起腐烂。这里只装本仓库真正跑得上的东西。
+$:
+  vscode:
+    - docker:
+        # 与 PR 门禁用同一个 python 镜像：3.13+ 是 pyproject.toml 的硬门槛，
+        # 用默认镜像还会撞上 `requires-python >= 3.13` 装不上包。
+        image: docker.cnb.cool/xmzzuzhi/cnb-docker/python:0.0.1
+      imports:
+        # GPG 密钥分发地址与 passphrase：install_gpg_keys.sh 缺变量即报错退出，
+        # 所以这两个变量必须由密钥仓库注入，绝不写进本文件。
+        - https://cnb.cool/XMZZUZHI/key/-/blob/main/Claude.yml
+      runner:
+        cpus: 8
+      services:
+        - vscode
+        - docker
+      stages:
+        - name: 安装jq
+          script:
+            - command -v jq >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y --no-install-recommends jq; }
+            - echo "jq 就绪"
+        - name: 授予install_gpg_keys.sh权限
+          script:
+            - chmod +x /workspace/install_gpg_keys.sh
+            - echo "已授予执行权限"
+        - name: 安装Python依赖
+          script:
+            # 只装 dev extra（pytest + PyYAML），运行期内核是纯标准库，没有第三方依赖。
+            - pip install -U pip
+            - pip install -e ".[dev]"
+            - echo "Python 依赖安装完成"
+        - name: 环境自检
+          script:
+            # 环境坏了要在启动阶段就喊出来，别等人改完代码跑测试才发现。
+            - python -V
+            # 本仓库要求 3.13+（tomllib 与类型注解都按这个版本写）
+            - python -c "import sys; sys.exit(0 if sys.version_info >= (3, 13) else '❌ Python 版本低于 3.13')"
+            # 只读探测 cosign：缺失时 verify 走退出码 3，属预期分支，不是环境故障
+            - command -v cosign >/dev/null 2>&1 && cosign version || echo "⚠️ 未安装 cosign：签名相关用例会自动跳过"
+            - echo "开发环境就绪：python -m pytest -q 可直接跑；提交前记得 bash install_gpg_keys.sh"
+
 main:
   push:
     - services:
