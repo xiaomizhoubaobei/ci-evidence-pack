@@ -10,3 +10,4 @@ build/
 pack-result.json
 verify-result.json
 _evidence/
+.claude

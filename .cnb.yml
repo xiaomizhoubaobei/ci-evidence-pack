@@ -77,6 +77,31 @@ $:
             - git lfs install
             - echo "Git LFS安装完成"
 main:
+  # PR 门禁：单测不过不允许合并。
+  # 注意：还需要在仓库「分支保护 / main」里把这条流水线设为必需检查，
+  # 否则它只是 PR 上的一个状态，不会真正拦住合并。
+  pull_request:
+    - name: 单元测试
+      runner:
+        cpus: 1
+      docker:
+        # 全量镜像自带 git / bash：测试夹具要建临时仓库，slim 镜像没装 git。
+        image: python:3.13
+      env:
+        # 与 CLAUDE.md 的本地命令保持一致；editable 安装只是拿到 pytest/PyYAML。
+        PYTHONPATH: src
+        PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      stages:
+        - name: 校验 Python 版本
+          script: |
+            python3 -V
+            python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 13) else 1)'
+        - name: 安装测试依赖
+          script: |
+            python3 -m pip install --quiet --root-user-action=ignore -e ".[dev]"
+        - name: 运行单元测试
+          script: |
+            python3 -m pytest -q
   push:
     - services:
         - docker
