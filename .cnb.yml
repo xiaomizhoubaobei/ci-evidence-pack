@@ -1,58 +1,81 @@
-# CNB 侧流水线。两件事：把本仓库强制镜像到 GitHub；给云端 VS Code 预置好开发环境。
-#
-# 单测、打包、Release 都不在这里跑：本仓库的验证入口是 `python -m pytest -q`
-# 与 GitHub Action（action.yml / examples/），CNB 不重复构建一遍。
-#
-# 凭据经密钥仓库注入（见 imports 的 Github.yml）：GIT_USERNAME / GIT_ACCESS_TOKEN
-# / GIT_EMAIL 三个变量由该文件提供，禁止在本文件写死任何 token。
-
-# 云端 VS Code 事件：`$.vscode` 只在「用 VS Code 打开本仓库」时触发，
-# 不参与 push / PR 流程。目的只有一个——把开箱即用的开发环境摆好，
-# 让人打开就能改代码、跑测试、签提交。
-#
-# 刻意保持精瘦：不预装任何 AI CLI，不克隆无关仓库。
-# CLI 是个人口味，装在本机即可；塞进云端镜像只会拖慢每次启动、
-# 还要跟着上游版本号一起腐烂。这里只装本仓库真正跑得上的东西。
 $:
   vscode:
     - docker:
-        # 与 PR 门禁用同一个 python 镜像：3.13+ 是 pyproject.toml 的硬门槛，
-        # 用默认镜像还会撞上 `requires-python >= 3.13` 装不上包。
         image: docker.cnb.cool/xmzzuzhi/cnb-docker/python:0.0.1
       imports:
-        # GPG 密钥分发地址与 passphrase：install_gpg_keys.sh 缺变量即报错退出，
-        # 所以这两个变量必须由密钥仓库注入，绝不写进本文件。
         - https://cnb.cool/XMZZUZHI/key/-/blob/main/Claude.yml
       runner:
-        cpus: 8
+        cpus: 64
       services:
         - vscode
         - docker
       stages:
-        - name: 安装jq
-          script:
-            - command -v jq >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y --no-install-recommends jq; }
-            - echo "jq 就绪"
         - name: 授予install_gpg_keys.sh权限
           script:
             - chmod +x /workspace/install_gpg_keys.sh
-            - echo "已授予执行权限"
-        - name: 安装Python依赖
-          script:
-            # 只装 dev extra（pytest + PyYAML），运行期内核是纯标准库，没有第三方依赖。
-            - pip install -U pip
-            - pip install -e ".[dev]"
-            - echo "Python 依赖安装完成"
-        - name: 环境自检
-          script:
-            # 环境坏了要在启动阶段就喊出来，别等人改完代码跑测试才发现。
-            - python -V
-            # 本仓库要求 3.13+（tomllib 与类型注解都按这个版本写）
-            - python -c "import sys; sys.exit(0 if sys.version_info >= (3, 13) else '❌ Python 版本低于 3.13')"
-            # 只读探测 cosign：缺失时 verify 走退出码 3，属预期分支，不是环境故障
-            - command -v cosign >/dev/null 2>&1 && cosign version || echo "⚠️ 未安装 cosign：签名相关用例会自动跳过"
-            - echo "开发环境就绪：python -m pytest -q 可直接跑；提交前记得 bash install_gpg_keys.sh"
 
+        - name: 安装claude CLI
+          script:
+            - npm install -g @anthropic-ai/claude-code
+            - echo "claude CLI安装完成"
+
+        # 白名单动作：取 CC_SETTINGS_URL → 保存为项目级 .claude/settings.local.json
+        - name: 同步 cc 项目级设置（仅白名单用户）
+          if: |
+            if [ "$CNB_BUILD_USER" != "qixiaoxin" ]; then
+              echo "不是白名单用户：${CNB_BUILD_USER}，跳过当前步骤，后续步骤继续执行"
+              exit 1
+            fi
+            echo "白名单用户：${CNB_BUILD_USER}（事件：${CNB_EVENT}）"
+            exit 0
+          script: |
+            PROJECT_ROOT="${PROJECT_ROOT:-/workspace}"
+            TARGET_DIR="$PROJECT_ROOT/.claude"
+            TARGET_FILE="$TARGET_DIR/settings.local.json"
+
+            URL="${CC_SETTINGS_URL:-}"
+            if [ -z "$URL" ]; then
+              echo "CC_SETTINGS_URL 未配置，不保存 settings.local.json，后续 stage 继续"
+              exit 0
+            fi
+
+            mkdir -p "$TARGET_DIR"
+            if ! curl -fsSL "$URL" -o "$TARGET_FILE"; then
+              echo "cc 设置下载失败，跳过本步骤内容，后续 stage 继续"
+              rm -f "$TARGET_FILE"
+              exit 0
+            fi
+
+            # 校验合法 JSON(此时 claude CLI 已装，node 可用)
+            if ! node -e "JSON.parse(require('fs').readFileSync(process.argv[process.argv.length-1],'utf8'))" "$TARGET_FILE"; then
+              echo "下载内容不是合法 JSON，已丢弃，后续 stage 继续"
+              rm -f "$TARGET_FILE"
+              exit 0
+            fi
+            echo "已保存 cc 项目级设置：$TARGET_FILE"
+
+        - name: 安装qwen CLI
+          script:
+            - npm install -g @qwen-code/qwen-code@latest
+            - echo "qwen CLI安装完成"
+        - name: 安装CodeBuddy CLI
+          script:
+            - npm install -g @tencent-ai/codebuddy-code
+            - echo "CodeBuddy CLI安装完成"
+        - name: 安装Qoder CLI
+          script:
+            - curl -fsSL https://qoder.com/install | bash
+            - echo "Qoder CLI安装完成"
+        - name: 安装sudo更新APT源
+          script:
+            - sudo apt-get update
+            - sudo apt-get install -y lsof net-tools jq
+            - echo "依赖完成"
+        - name: 安装Git LFS
+          script:
+            - sudo apt-get install -y git-lfs
+            - git lfs install
+            - echo "Git LFS安装完成"
 main:
   push:
     - services:
